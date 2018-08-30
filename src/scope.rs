@@ -8,9 +8,9 @@ use ffi;
 use function::Function;
 use lua::Lua;
 use types::Callback;
-use userdata::{AnyUserData, UserData};
 use util::{assert_stack, take_userdata, StackGuard};
 use value::{FromLuaMulti, ToLuaMulti};
+use userdata::{AnyUserData, UserData, UserDataMethods, BorrowerType};
 
 /// Constructed by the [`Lua::scope`] method, allows temporarily passing to Lua userdata that is
 /// !Send, and callbacks that are !Send and not 'static.
@@ -122,6 +122,32 @@ impl<'scope> Scope<'scope> {
             }));
             Ok(u)
         }
+    }
+
+    pub fn borrow_userdata<'lua, T>(&'lua self, data: &'scope mut T) -> Result<AnyUserData<'lua>>
+        where T: UserData
+    {
+        self.create_userdata(BorrowedUserData { ptr: data as *mut T })
+    }
+}
+
+pub(crate) struct BorrowedUserData<T: UserData> {
+    pub(crate) ptr: *mut T,
+}
+
+impl<T: UserData> UserData for BorrowedUserData<T> {
+    fn add_methods(methods: &mut UserDataMethods<Self>) {
+        use std::collections::HashMap;
+        let mut base_methods = UserDataMethods {
+            methods: HashMap::new(),
+            meta_methods: HashMap::new(),
+            borrower: BorrowerType::Borrowed,
+            _type: PhantomData,
+        };
+
+        T::add_methods(&mut base_methods);
+        methods.methods = base_methods.methods;
+        methods.meta_methods = base_methods.meta_methods;
     }
 }
 

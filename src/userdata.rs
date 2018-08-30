@@ -9,6 +9,7 @@ use lua::Lua;
 use types::{Callback, LuaRef};
 use util::{assert_stack, get_userdata, StackGuard};
 use value::{FromLua, FromLuaMulti, ToLua, ToLuaMulti};
+use scope::BorrowedUserData;
 
 /// Kinds of metamethods that can be overridden.
 ///
@@ -68,12 +69,53 @@ pub enum MetaMethod {
     ToString,
 }
 
+#[derive(Copy,Clone)]
+pub(crate) enum BorrowerType {
+    Owned,
+    Borrowed,
+}
+
+impl BorrowerType {
+    fn with_borrow<'lua, T, F, R>(&self, any: &AnyUserData<'lua>, f: F) -> Result<R>
+        where F: FnOnce(&T) -> Result<R>,
+              T: UserData
+    {
+        match self {
+            BorrowerType::Owned => {
+                let userdata = any.borrow::<T>()?;
+                f(&userdata)
+            }
+            BorrowerType::Borrowed => {
+                let userdata = any.borrow::<BorrowedUserData<T>>()?;
+                f(unsafe { &*userdata.ptr })
+            }
+        }
+    }
+
+    fn with_borrow_mut<'lua, T, F, R>(&self, any: &AnyUserData<'lua>, f: F) -> Result<R>
+        where F: FnOnce(&mut T) -> Result<R>,
+              T: UserData
+    {
+        match self {
+            BorrowerType::Owned => {
+                let mut userdata = any.borrow_mut::<T>()?;
+                f(&mut userdata)
+            }
+            BorrowerType::Borrowed => {
+                let userdata = any.borrow::<BorrowedUserData<T>>()?;
+                f(unsafe { &mut *userdata.ptr })
+            }
+        }
+    }
+}
+
 /// Method registry for [`UserData`] implementors.
 ///
 /// [`UserData`]: trait.UserData.html
 pub struct UserDataMethods<'lua, T> {
     pub(crate) methods: HashMap<StdString, Callback<'lua, 'static>>,
     pub(crate) meta_methods: HashMap<MetaMethod, Callback<'lua, 'static>>,
+    pub(crate) borrower: BorrowerType,
     pub(crate) _type: PhantomData<T>,
 }
 
@@ -86,13 +128,11 @@ impl<'lua, T: UserData> UserDataMethods<'lua, T> {
     /// If `add_meta_method` is used to set the `__index` metamethod, the `__index` metamethod will
     /// be used as a fall-back if no regular method is found.
     pub fn add_method<A, R, M>(&mut self, name: &str, method: M)
-    where
-        A: FromLuaMulti<'lua>,
-        R: ToLuaMulti<'lua>,
-        M: 'static + Send + Fn(&'lua Lua, &T, A) -> Result<R>,
+        where A: FromLuaMulti<'lua>,
+              R: ToLuaMulti<'lua>,
+              M: 'static + Send + Fn(&'lua Lua, &T, A) -> Result<R>
     {
-        self.methods
-            .insert(name.to_owned(), Self::box_method(method));
+        self.methods.insert(name.to_owned(), Self::box_method(method, self.borrower));
     }
 
     /// Add a regular method which accepts a `&mut T` as the first parameter.
@@ -101,13 +141,11 @@ impl<'lua, T: UserData> UserDataMethods<'lua, T> {
     ///
     /// [`add_method`]: #method.add_method
     pub fn add_method_mut<A, R, M>(&mut self, name: &str, method: M)
-    where
-        A: FromLuaMulti<'lua>,
-        R: ToLuaMulti<'lua>,
-        M: 'static + Send + FnMut(&'lua Lua, &mut T, A) -> Result<R>,
+        where A: FromLuaMulti<'lua>,
+              R: ToLuaMulti<'lua>,
+              M: 'static + Send + FnMut(&'lua Lua, &mut T, A) -> Result<R>
     {
-        self.methods
-            .insert(name.to_owned(), Self::box_method_mut(method));
+        self.methods.insert(name.to_owned(), Self::box_method_mut(method, self.borrower));
     }
 
     /// Add a regular method as a function which accepts generic arguments, the first argument will
@@ -152,12 +190,11 @@ impl<'lua, T: UserData> UserDataMethods<'lua, T> {
     ///
     /// [`add_meta_function`]: #method.add_meta_function
     pub fn add_meta_method<A, R, M>(&mut self, meta: MetaMethod, method: M)
-    where
-        A: FromLuaMulti<'lua>,
-        R: ToLuaMulti<'lua>,
-        M: 'static + Send + Fn(&'lua Lua, &T, A) -> Result<R>,
+        where A: FromLuaMulti<'lua>,
+              R: ToLuaMulti<'lua>,
+              M: 'static + Send + Fn(&'lua Lua, &T, A) -> Result<R>
     {
-        self.meta_methods.insert(meta, Self::box_method(method));
+        self.meta_methods.insert(meta, Self::box_method(method, self.borrower));
     }
 
     /// Add a metamethod as a function which accepts a `&mut T` as the first parameter.
@@ -169,12 +206,11 @@ impl<'lua, T: UserData> UserDataMethods<'lua, T> {
     ///
     /// [`add_meta_function`]: #method.add_meta_function
     pub fn add_meta_method_mut<A, R, M>(&mut self, meta: MetaMethod, method: M)
-    where
-        A: FromLuaMulti<'lua>,
-        R: ToLuaMulti<'lua>,
-        M: 'static + Send + FnMut(&'lua Lua, &mut T, A) -> Result<R>,
+        where A: FromLuaMulti<'lua>,
+              R: ToLuaMulti<'lua>,
+              M: 'static + Send + FnMut(&'lua Lua, &mut T, A) -> Result<R>
     {
-        self.meta_methods.insert(meta, Self::box_method_mut(method));
+        self.meta_methods.insert(meta, Self::box_method_mut(method, self.borrower));
     }
 
     /// Add a metamethod which accepts generic arguments.
@@ -230,17 +266,17 @@ impl<'lua, T: UserData> UserDataMethods<'lua, T> {
         })
     }
 
-    fn box_method<A, R, M>(method: M) -> Callback<'lua, 'static>
-    where
-        A: FromLuaMulti<'lua>,
-        R: ToLuaMulti<'lua>,
-        M: 'static + Send + Fn(&'lua Lua, &T, A) -> Result<R>,
+    fn box_method<A, R, M>(method: M, borrower: BorrowerType) -> Callback<'lua, 'static>
+        where A: FromLuaMulti<'lua>,
+              R: ToLuaMulti<'lua>,
+              M: 'static + Send + Fn(&'lua Lua, &T, A) -> Result<R>
     {
         Box::new(move |lua, mut args| {
             if let Some(front) = args.pop_front() {
                 let userdata = AnyUserData::from_lua(front, lua)?;
-                let userdata = userdata.borrow::<T>()?;
-                method(lua, &userdata, A::from_lua_multi(args, lua)?)?.to_lua_multi(lua)
+                borrower.with_borrow(&userdata, |borrowed| {
+                    method(lua, borrowed, A::from_lua_multi(args, lua)?)?.to_lua_multi(lua)
+                })
             } else {
                 Err(Error::FromLuaConversionError {
                     from: "missing argument",
@@ -251,21 +287,20 @@ impl<'lua, T: UserData> UserDataMethods<'lua, T> {
         })
     }
 
-    fn box_method_mut<A, R, M>(method: M) -> Callback<'lua, 'static>
-    where
-        A: FromLuaMulti<'lua>,
-        R: ToLuaMulti<'lua>,
-        M: 'static + Send + FnMut(&'lua Lua, &mut T, A) -> Result<R>,
+    fn box_method_mut<A, R, M>(method: M, borrower: BorrowerType) -> Callback<'lua, 'static>
+        where A: FromLuaMulti<'lua>,
+              R: ToLuaMulti<'lua>,
+              M: 'static + Send + FnMut(&'lua Lua, &mut T, A) -> Result<R>
     {
         let method = RefCell::new(method);
         Box::new(move |lua, mut args| {
             if let Some(front) = args.pop_front() {
                 let userdata = AnyUserData::from_lua(front, lua)?;
-                let mut userdata = userdata.borrow_mut::<T>()?;
-                let mut method = method
-                    .try_borrow_mut()
-                    .map_err(|_| Error::RecursiveMutCallback)?;
-                (&mut *method)(lua, &mut userdata, A::from_lua_multi(args, lua)?)?.to_lua_multi(lua)
+                borrower.with_borrow_mut(&userdata, |borrowed| {
+                    let mut method = method.try_borrow_mut()
+                        .map_err(|_| Error::RecursiveMutCallback)?;
+                    (&mut *method)(lua, borrowed, A::from_lua_multi(args, lua)?)?.to_lua_multi(lua)
+                })
             } else {
                 Err(Error::FromLuaConversionError {
                     from: "missing argument",

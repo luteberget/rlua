@@ -17,7 +17,7 @@ use string::String;
 use table::Table;
 use thread::Thread;
 use types::{Callback, Integer, LightUserData, LuaRef, Number, RegistryKey};
-use userdata::{AnyUserData, MetaMethod, UserData, UserDataMethods};
+use userdata::{AnyUserData, MetaMethod, UserData, UserDataMethods, BorrowerType};
 use util::{
     assert_stack, callback_error, check_stack, gc_guard, get_userdata, get_wrapped_error,
     init_error_metatables, main_state, pop_error, protect_lua, protect_lua_closure, push_string,
@@ -802,6 +802,7 @@ impl Lua {
         let mut methods = UserDataMethods {
             methods: HashMap::new(),
             meta_methods: HashMap::new(),
+            borrower: BorrowerType::Owned,
             _type: PhantomData,
         };
         T::add_methods(&mut methods);
